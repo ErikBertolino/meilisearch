@@ -153,6 +153,14 @@ make_enum_progress! {
 }
 
 make_enum_progress! {
+    pub enum TaskQueueCompactionProgress {
+        CreateTemporaryFile,
+        CopyAndCompactTaskQueue,
+        PersistTheCompactedTaskQueue,
+    }
+}
+
+make_enum_progress! {
     pub enum InnerSwappingTwoIndexes {
         RetrieveTheTasks,
         UpdateTheTasks,

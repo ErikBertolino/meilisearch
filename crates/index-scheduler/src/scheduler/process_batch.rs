@@ -15,14 +15,14 @@ use meilisearch_types::tasks::{Details, IndexSwap, Kind, KindWithContent, Status
 use meilisearch_types::versioning::{VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH};
 use milli::update::Settings as MilliSettings;
 use roaring::{MultiOps, RoaringBitmap};
-use tempfile::{PersistError, TempPath};
+use tempfile::{NamedTempFile, PersistError, TempPath};
 use time::OffsetDateTime;
 
 use super::create_batch::Batch;
 use crate::processing::{
     AtomicBatchStep, AtomicTaskStep, CreateIndexProgress, DeleteIndexProgress, FinalizingIndexStep,
     IndexCompaction, InnerSwappingTwoIndexes, SwappingTheIndexes, TaskCancelationProgress,
-    TaskDeletionProgress, UpdateIndexProgress,
+    TaskDeletionProgress, TaskQueueCompactionProgress, UpdateIndexProgress,
 };
 use crate::utils::{consecutive_ranges, swap_index_uid_in_task, ProcessingBatch};
 use crate::{Error, IndexScheduler, Result, TaskId, BEI128};
@@ -473,6 +473,38 @@ impl IndexScheduler {
 
                 Ok((vec![task], ProcessBatchInfo::default()))
             }
+            Batch::TaskQueueCompaction { mut task } => {
+                let ret = catch_unwind(AssertUnwindSafe(|| {
+                    self.apply_task_queue_compaction(&mut task, &progress)
+                }));
+
+                let (pre_size, post_size) = match ret {
+                    Ok(Ok(stats)) => stats,
+                    Ok(Err(Error::AbortedTask)) => return Err(Error::AbortedTask),
+                    Ok(Err(e)) => return Err(e),
+                    Err(e) => {
+                        let msg = match e.downcast_ref::<&'static str>() {
+                            Some(s) => *s,
+                            None => match e.downcast_ref::<String>() {
+                                Some(s) => &s[..],
+                                None => "Box<dyn Any>",
+                            },
+                        };
+                        return Err(Error::ProcessBatchPanicked(msg.to_string()));
+                    }
+                };
+
+                if let Some(Details::TaskQueueCompaction {
+                    pre_deletion_size,
+                    post_deletion_size,
+                }) = task.details.as_mut()
+                {
+                    *pre_deletion_size = Some(Byte::from_u64(pre_size));
+                    *post_deletion_size = Some(Byte::from_u64(post_size));
+                }
+
+                Ok((vec![task], ProcessBatchInfo::default()))
+            }
             Batch::Export { mut task } => {
                 let KindWithContent::Export { url, api_key, payload_size, indexes } = &task.kind
                 else {
@@ -584,7 +616,7 @@ impl IndexScheduler {
         index
             .copy_to_file(file.as_file_mut(), CompactionOption::Enabled)
             .map_err(|error| Error::Milli { error, index_uid: Some(index_uid.to_string()) })?;
-        // ...and reset the file position as specified in the documentation
+        // ...and reset the file position as specified in the heed documentation
         file.seek(SeekFrom::Start(0))?;
 
         // 4. We replace the index data file with the temporary file
@@ -636,6 +668,72 @@ impl IndexScheduler {
         };
 
         Ok((pre_size, post_size))
+    }
+
+    fn apply_task_queue_compaction(
+        &self,
+        task: &mut Task,
+        progress: &Progress,
+    ) -> Result<(u64, u64)> {
+        let tasks_path = self.env.path();
+        let src_path = tasks_path.join("data.mdb");
+        let pre_size = std::fs::metadata(&src_path)?.len();
+        let max_attempts = 10usize;
+
+        for attempt in 1..=max_attempts {
+            let mut wtxn = self.env.write_txn().map_err(Error::HeedTransaction)?;
+            let last_task_id_before_compaction = self.queue.tasks.last_task_id(&wtxn)?;
+
+            // Mark the task as succeeded and persist it before compaction,
+            // so the compacted DB already contains the succeeded status.
+            task.status = Status::Succeeded;
+            self.queue.tasks.update_task(&mut wtxn, task)?;
+
+            progress.update_progress(TaskQueueCompactionProgress::CreateTemporaryFile);
+            let dest_path = TempPath::from_path(tasks_path.join(DATA_MDB_COPY_NAME));
+            let dest_file = File::create(&dest_path)?;
+            let mut dest_file = tempfile::NamedTempFile::from_parts(dest_file, dest_path);
+            let dest_file = std::thread::scope(move |s| {
+                let handle = s.spawn(move || -> Result<NamedTempFile> {
+                    progress.update_progress(TaskQueueCompactionProgress::CopyAndCompactTaskQueue);
+                    self.env.copy_to_file(dest_file.as_file_mut(), CompactionOption::Enabled)?;
+                    // reset the file position as specified in the heed documentation
+                    dest_file.seek(SeekFrom::Start(0))?;
+
+                    Ok(dest_file)
+                });
+
+                // the compaction in the scoped thread above will only start after the commit completes.
+                wtxn.commit().map_err(Error::HeedTransaction)?;
+                handle.join().unwrap()
+            })?;
+
+            let wtxn = self.env.write_txn().map_err(Error::HeedTransaction)?;
+            let last_task_id_after_compaction = self.queue.tasks.last_task_id(&wtxn)?;
+
+            if last_task_id_before_compaction != last_task_id_after_compaction {
+                tracing::warn!(
+                    "Task queue compaction failed: task queue was updated after compaction. Retrying {attempt}/{max_attempts}"
+                );
+
+                continue;
+            }
+
+            progress.update_progress(TaskQueueCompactionProgress::PersistTheCompactedTaskQueue);
+            let file = dest_file.persist(&src_path)?;
+            file.sync_all()?;
+            let post_size = file.metadata()?.len();
+            tracing::info!("Task queue compacted: used size {pre_size} -> {post_size} bytes");
+            wtxn.abort();
+
+            #[cfg(test)]
+            return Ok((pre_size, post_size));
+
+            #[cfg(not(test))]
+            std::process::exit(0);
+        }
+
+        Err(Error::TaskQueueCompactionMaxAttemptReached { attempts: max_attempts })
     }
 
     /// Swap the index `lhs` with the index `rhs`.

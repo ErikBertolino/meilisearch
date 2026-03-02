@@ -64,6 +64,7 @@ mod export_analytics;
 pub mod features;
 pub mod indexes;
 mod logs;
+mod maintenance;
 mod metrics;
 mod multi_search;
 mod multi_search_analytics;
@@ -95,6 +96,7 @@ mod webhooks;
         (path = "/export", api = export::ExportApi),
         (path = "/network", api = network::NetworkApi),
         (path = "/webhooks", api = webhooks::WebhooksApi),
+        (path = "/maintenance", api = maintenance::MaintenanceApi),
     ),
     paths(get_health, get_version, get_stats),
     tags(
@@ -132,7 +134,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .service(web::scope("/network").configure(network::configure))
         .service(web::scope("/export").configure(export::configure))
         .service(web::scope("/chats").configure(chats::configure))
-        .service(web::scope("/webhooks").configure(webhooks::configure));
+        .service(web::scope("/webhooks").configure(webhooks::configure))
+        .service(web::scope("/maintenance").configure(maintenance::configure));
 
     #[cfg(feature = "swagger")]
     {
