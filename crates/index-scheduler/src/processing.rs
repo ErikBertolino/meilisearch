@@ -157,6 +157,7 @@ make_enum_progress! {
         CreateTemporaryFile,
         CopyAndCompactTaskQueue,
         PersistTheCompactedTaskQueue,
+        WaitForTheInstanceToRestart,
     }
 }
 

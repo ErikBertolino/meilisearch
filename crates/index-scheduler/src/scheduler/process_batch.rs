@@ -3,6 +3,7 @@ use std::fs::{remove_file, File};
 use std::io::{ErrorKind, Seek, SeekFrom};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use byte_unit::Byte;
 use meilisearch_types::batches::BatchId;
@@ -724,13 +725,11 @@ impl IndexScheduler {
             file.sync_all()?;
             let post_size = file.metadata()?.len();
             tracing::info!("Task queue compacted: used size {pre_size} -> {post_size} bytes");
-            wtxn.abort();
 
-            #[cfg(test)]
-            return Ok((pre_size, post_size));
-
-            #[cfg(not(test))]
-            std::process::exit(0);
+            progress.update_progress(TaskQueueCompactionProgress::WaitForTheInstanceToRestart);
+            loop {
+                std::thread::sleep(Duration::from_millis(500));
+            }
         }
 
         Err(Error::TaskQueueCompactionMaxAttemptReached { attempts: max_attempts })

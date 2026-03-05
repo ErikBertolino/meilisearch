@@ -1,0 +1,64 @@
+{
+  "type": "test",
+  "name": "task_queue_compaction",
+  "binary": {
+    "source": "release",
+    "edition": "community",
+    "version": "1.38.0"
+  },
+  "commands": [
+    {
+      "route": "indexes/movies/settings",
+      "method": "PATCH",
+      "body": {
+        "inline": {
+          "filterableAttributes": [
+            "genres",
+            "release_date"
+          ],
+          "searchableAttributes": [
+            "title",
+            "overview"
+          ],
+          "sortableAttributes": [
+            "release_date"
+          ]
+        }
+      },
+      "expectedStatus": 202,
+      "expectedResponse": {
+        "enqueuedAt": "[timestamp]",
+        "indexUid": "movies",
+        "status": "enqueued",
+        "taskUid": 0,
+        "type": "settingsUpdate"
+      },
+      "synchronous": "DontWait"
+    },
+    {
+      "route": "indexes/movies/documents",
+      "method": "POST",
+      "body": {
+        "asset": "movies.json"
+      },
+      "expectedStatus": 202,
+      "expectedResponse": {
+        "enqueuedAt": "[timestamp]",
+        "indexUid": "movies",
+        "status": "enqueued",
+        "taskUid": 1,
+        "type": "documentAdditionOrUpdate"
+      },
+      "synchronous": "WaitForTask"
+    },
+    {
+      "binary": {
+        "source": "build",
+        "extraCliArgs": [
+          "--experimental-dumpless-upgrade",
+          "--experimental-max-number-of-batched-tasks=0"
+        ]
+      }
+    }
+  ]
+}
